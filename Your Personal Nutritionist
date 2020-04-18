@@ -1,0 +1,258 @@
+from datetime import timedelta, datetime, time
+from collections import defaultdict
+from decimal import Decimal
+
+from django.db import models
+from django.contrib.auth.models import User
+from django.conf import settings
+from django.utils import timezone
+from django.utils.functional import cached_property
+from django.core.validators import MinValueValidator
+from django.core.exceptions import ValidationError
+
+from ingredients.models import AbstractBaseNutrients,Ingredient
+from recipes.models import Recipe
+from ingredients.utils import add_nutrition_ratios
+
+
+
+not_negative = MinValueValidator(0)
+
+
+class DiaryFood(AbstractBaseNutrients):
+    
+   
+
+    class Meta:
+        
+        ordering = ["-start_time"]
+
+        name = models.CharField(
+        max_length=settings.NAME_LENGTH,
+        blank=True,
+        null=False,    
+        help_text="Name of the entry i.e. description of the food",)
+
+   
+        start_time = models.DateTimeField(
+        blank=False,
+        null=False,
+        help_text="Time meal started",)
+
+   
+        user = models.ForeignKey(
+        User,
+        blank=False,
+        null=False,
+        on_delete=models.CASCADE,
+        related_name='+',)
+
+        cost = models.DecimalField(
+        decimal_places=2,
+        max_digits=4,
+        null=True,     
+        blank=True,
+        validators=[not_negative],
+        help_text="WARNING: Only for once-off items! Cost and nutrients will be overwritten by ingredients or recipes")
+
+   
+       weight = models.DecimalField(
+       decimal_places=3,
+       max_digits=7,     
+       null=True,     
+       blank=True,
+       validators=[not_negative],
+       help_text="grams of a recipe/ingredient; WARNING: using servings will OVERWRITE this value!")
+
+       servings = models.DecimalField(
+       decimal_places=2,
+       max_digits=4,     
+       null=True,
+       blank=True,
+       validators=[not_negative],
+       help_text="number of servings of a recipe/ingredient- WARNING: entering this will overwrite weight & cost automatically")
+
+   
+      of_ingredient = models.ForeignKey(
+      Ingredient,
+      on_delete=models.CASCADE,
+      null=True,
+      blank=True,
+      related_name='consumed',)
+      
+      of_recipe = models.ForeignKey(
+      Recipe,
+      on_delete=models.CASCADE,
+      null=True,
+      blank=True,
+      related_name='consumed',)
+
+   def __str__(self):
+       
+       return "%s: %s"%(self.start_time,self.name)
+
+   def clean(self):
+      
+      if self.of_recipe:
+         if not (self.servings or self.weight):
+            raise ValidationError('When using a recipe, must specify weight or servings')
+      elif self.of_ingredient:
+         if not (self.servings or self.weight):
+            raise ValidationError('Must specify weight of Ingredient (or servings if set on Ingredient)')
+         elif self.servings and (not self.of_ingredient.serving):
+            raise ValidationError('Ingredient does not have servings listed - use raw weight instead')
+
+      super(DiaryFood, self).clean()
+
+   def save(self, *args, **kwargs):
+      
+      if self.of_recipe:
+          
+          ndata = self.of_recipe.nutrition_data
+
+         
+          if self.servings:
+              
+              self.weight = ndata['grams_serve'] * self.servings   
+          else:
+              
+              self.servings = self.weight / ndata['grams_serve']
+
+         
+          for k in settings.NUTRITION_DATA_ITEMS_BASIC:
+             
+              try:  
+                  setattr(self, k, self.servings * ndata["%s_serve"%k])
+                  
+              except (KeyError,TypeError):
+                  
+                  
+                  setattr(self, k, None)
+          try:
+              
+              if ndata['cost_serve']:
+                   
+                  self.cost = self.servings * ndata['cost_serve'] 
+          except:
+                          
+              pass
+
+          if not self.name:
+              
+              self.name = self.of_recipe.name
+
+          elif self.of_ingredient:
+              
+              ndata = self.of_ingredient.nutrition_data
+
+         
+
+         if self.servings and self.of_ingredient.serving:
+             
+             self.weight = self.of_ingredient.serving * self.servings   
+         elif self.weight is None:
+             
+             raise ValueError('Ingredient has no serving - must explicitly specify weight')
+
+         for k in settings.NUTRITION_DATA_ITEMS_BASIC:
+             
+             val = getattr(self.of_ingredient, k)
+             if val is not None:
+                 
+                 setattr(self, k, self.weight * settings.G_PER_KG * val)
+             else:
+                 
+                 setattr(self, k, None)
+            if ndata['cost']:
+                
+                self.cost = self.weight * settings.G_PER_KG * ndata['cost'] 
+         if not self.name:
+             
+             self.name = self.of_ingredient.name
+
+      super(DiaryFood, self).save(*args, **kwargs)
+
+   @cached_property
+   def nutrition_data(self):
+       
+       data = dict()
+       data['cost']=self.cost 
+
+       data['grams']=self.weight
+       for k in settings.NUTRITION_DATA_ITEMS_BASIC:
+           
+           data[k] = getattr(self,k)
+
+           return add_nutrition_ratios(data)
+
+   @staticmethod
+   def get_diary_aggs(user, times):
+       
+      return None  
+
+   @staticmethod
+   def get_recent_diary_aggs(user):
+      
+      context = {}
+      now = timezone.now()
+      naivenow = datetime.now() # For "today" calc only
+      today = now-timedelta(
+         hours=naivenow.hour,
+         minutes=naivenow.minute,         
+         seconds=naivenow.second,
+      )
+      last24 = now-timedelta(days=1)
+      lastday = today-timedelta(days=1)
+
+      today_df = list()
+      last24_df = list()
+      lastday_df = list()
+      today_total = defaultdict(Decimal)
+      last24_total = defaultdict(Decimal)
+      lastday_total = defaultdict(Decimal)
+
+      qset_all = DiaryFood.objects.filter(
+         user=user,
+         start_time__gte=lastday,
+         start_time__lte=now,   
+      )
+
+      for df in qset_all.iterator():
+         ndata = df.nutrition_data
+         if df.start_time >= today:
+            today_df.append(df)
+            for k in settings.NUTRITION_DATA_ITEMS:
+               if ndata[k]:
+                  today_total[k] += ndata[k]
+         elif df.start_time >= last24:
+            last24_df.append(df)
+            for k in settings.NUTRITION_DATA_ITEMS:
+               if ndata[k]:
+                  last24_total[k] += ndata[k]
+         else:
+            lastday_df.append(df)
+            for k in settings.NUTRITION_DATA_ITEMS:
+               if ndata[k]:
+                  lastday_total[k] += ndata[k]
+
+      context['today_objects']=today_df
+      context['last24_objects']=last24_df
+      context['lastday_objects']=lastday_df
+
+      context['last24_sum']=add_nutrition_ratios(defaultdict(Decimal,
+         { k: today_total.get(k, 0) + last24_total.get(k, 0) for k in set(today_total) | set(last24_total) }
+      ))
+      context['lastday_sum']=add_nutrition_ratios(
+         { k: lastday_total.get(k, 0) + last24_total.get(k, 0) for k in set(lastday_total) | set(last24_total) }
+      )
+
+      context['today_total']=add_nutrition_ratios(today_total)
+      context['last24_total']=add_nutrition_ratios(last24_total)
+      context['lastday_total']=add_nutrition_ratios(lastday_total)
+
+      context['ref_now']=now
+      context['ref_today']=today
+      context['ref_last24']=last24
+      context['ref_lastday']=lastday
+
+      return context
